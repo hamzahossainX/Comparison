@@ -1,0 +1,149 @@
+# Builds all three comparison sites and publishes them to GitHub Pages under one domain.
+#
+#   https://hamzahossainX.github.io/Comparison/           landing page
+#   https://hamzahossainX.github.io/Comparison/claude/    Claude build
+#   https://hamzahossainX.github.io/Comparison/kimi-k3/   Kimi K2 build
+#   https://hamzahossainX.github.io/Comparison/codex/     Codex build
+#
+# One-time setup: Settings -> Pages -> Source: "GitHub Actions". No secrets required; the
+# workflow authenticates with the automatic GITHUB_TOKEN.
+#
+# WHY EACH BUILD IS INSTALLED SEPARATELY
+# The three projects deliberately sit on different stacks — Claude and KIMI-K3 on Next.js 14 /
+# React 18 / Tailwind 3, Codex on Vite 7 / React 19 / Tailwind 4. Each keeps its own
+# package-lock.json and its own node_modules, and `npm ci` runs inside each directory. Nothing
+# is hoisted and no dependency is shared, so the React 18/19 and Tailwind 3/4 splits cannot
+# collide. Preserving that split is the point of the comparison, not an accident to be resolved.
+
+name: Deploy all three sites to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never cancel an in-flight deployment: a half-published site is worse than a queued one.
+# Queue instead, and let the newest run land last.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build all three
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    env:
+      # Derived from the repository name so a rename or a fork cannot silently break asset URLs.
+      BASE: /${{ github.event.repository.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          # 22 satisfies Vite 7 (^20.19 || >=22.12) and Next.js 14 alike.
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            Claude/package-lock.json
+            KIMI-K3/package-lock.json
+            Codex/package-lock.json
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      # ---- Claude — Next.js 14 static export --------------------------------
+      - name: Install Claude
+        working-directory: Claude
+        run: npm ci
+      - name: Build Claude
+        working-directory: Claude
+        run: npm run build
+        env:
+          PAGES_BASE_PATH: ${{ env.BASE }}/claude
+
+      # ---- KIMI-K3 — Next.js 14 static export -------------------------------
+      - name: Install KIMI-K3
+        working-directory: KIMI-K3
+        run: npm ci
+      - name: Build KIMI-K3
+        working-directory: KIMI-K3
+        run: npm run build
+        env:
+          PAGES_BASE_PATH: ${{ env.BASE }}/kimi-k3
+
+      # ---- Codex — Vite 7 build ---------------------------------------------
+      # Vite requires its base to end in a slash; Next.js requires its basePath NOT to.
+      - name: Install Codex
+        working-directory: Codex
+        run: npm ci
+      - name: Build Codex
+        working-directory: Codex
+        run: npm run build
+        env:
+          PAGES_BASE_PATH: ${{ env.BASE }}/codex/
+
+      # ---- Assemble the published tree --------------------------------------
+      - name: Assemble site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp docs/landing/index.html _site/index.html
+          cp -r docs/previews _site/previews
+          cp -r Claude/out    _site/claude
+          cp -r KIMI-K3/out   _site/kimi-k3
+          cp -r Codex/dist    _site/codex
+          # Stop GitHub Pages' Jekyll pass from dropping _next/ and other underscore paths.
+          touch _site/.nojekyll
+          echo "── published tree ──"
+          find _site -maxdepth 2 -not -path '*/_next/*' -not -path '*/assets/*' | sort | head -40
+
+      - name: Verify no build is missing its entry point
+        run: |
+          set -euo pipefail
+          fail=0
+          for p in index.html claude/index.html kimi-k3/index.html codex/index.html; do
+            if [ -s "_site/$p" ]; then
+              echo "ok      _site/$p"
+            else
+              echo "MISSING _site/$p"; fail=1
+            fi
+          done
+          # Assets must be rewritten to the repository subpath. A root-absolute /_next or
+          # /assets reference here means the basePath did not apply and the site will 404.
+          for p in claude kimi-k3 codex; do
+            if grep -qE '(src|href)="/(_next|assets)/' "_site/$p/index.html"; then
+              echo "LEAK    _site/$p/index.html has root-absolute asset URLs"; fail=1
+            else
+              echo "ok      _site/$p asset URLs are subpath-relative"
+            fi
+          done
+          exit $fail
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
